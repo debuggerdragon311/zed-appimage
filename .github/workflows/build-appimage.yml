@@ -16,18 +16,23 @@ on:
         default: 'false'
         type: boolean
 
+env:
+  # Silence the Node 20 deprecation warnings for actions/checkout
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write   # needed to create releases and upload assets
 
 jobs:
   check-and-build:
+    # All builds run on x86_64 runners — appimagetool cross-builds for aarch64
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         arch:
-          - { runner_arch: x86_64, zed_arch: x86_64, appimage_arch: x86_64 }
-          - { runner_arch: aarch64, zed_arch: aarch64, appimage_arch: aarch64 }
+          - { zed_arch: x86_64,  appimage_arch: x86_64  }
+          - { zed_arch: aarch64, appimage_arch: aarch64  }
 
     name: Build AppImage (${{ matrix.arch.zed_arch }})
 
@@ -45,8 +50,13 @@ jobs:
               https://api.github.com/repos/zed-industries/zed/releases/latest \
               | jq -r '.tag_name')
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "version_num=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          # Validate looks like a version tag
+          if [[ ! "$VERSION" =~ ^v[0-9] ]]; then
+            echo "ERROR: Unexpected version string: '$VERSION'" >&2
+            exit 1
+          fi
+          echo "version=$VERSION"           >> "$GITHUB_OUTPUT"
+          echo "version_num=${VERSION#v}"   >> "$GITHUB_OUTPUT"
           echo "Resolved Zed version: $VERSION"
 
       # ── 2. Check if we already have a release for this version ──────────────
@@ -59,21 +69,22 @@ jobs:
           TAG="${{ steps.version.outputs.version }}"
           FORCE="${{ github.event.inputs.force_rebuild }}"
 
+          # Use || true so the step never fails when the release doesn't exist yet
           EXISTS=$(gh release view "$TAG" \
             --repo "${{ github.repository }}" \
-            --json assets \
-            --jq ".assets[] | select(.name | test(\"zed-${ARCH}.AppImage\")) | .name" \
-            2>/dev/null || echo "")
+            --json assets 2>/dev/null \
+            | jq -r ".assets[] | select(.name == \"zed-${ARCH}.AppImage\") | .name" \
+            2>/dev/null || true)
 
           if [[ -n "$EXISTS" && "$FORCE" != "true" ]]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
             echo "AppImage for $TAG ($ARCH) already exists — skipping."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "Will build AppImage for $TAG ($ARCH)."
           fi
 
-      # ── 3. Checkout this repo (for AppDir skeleton & scripts) ───────────────
+      # ── 3. Checkout this repo (for scripts) ─────────────────────────────────
       - name: Checkout
         if: steps.existing.outputs.skip == 'false'
         uses: actions/checkout@v4
@@ -87,29 +98,32 @@ jobs:
             wget curl file libfuse2 desktop-file-utils \
             libglib2.0-bin imagemagick
 
-      # ── 5. Download appimagetool ─────────────────────────────────────────────
+      # ── 5. Download appimagetool (ALWAYS x86_64 — the host tool, not target) ─
       - name: Download appimagetool
         if: steps.existing.outputs.skip == 'false'
         run: |
-          ARCH="${{ matrix.arch.appimage_arch }}"
+          # appimagetool is a HOST tool that runs on the x86_64 CI runner.
+          # The TARGET arch is controlled by the ARCH env var at package time.
           wget -q \
-            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${ARCH}.AppImage" \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
             -O /usr/local/bin/appimagetool
           chmod +x /usr/local/bin/appimagetool
-          # Run in extract-and-run mode (no FUSE needed in CI)
+          # FUSE is unavailable in CI containers — use extract-and-run mode
           echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+          appimagetool --version
 
       # ── 6. Download official Zed tarball ─────────────────────────────────────
       - name: Download Zed tarball
         if: steps.existing.outputs.skip == 'false'
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          ARCH="${{ matrix.arch.zed_arch }}"
-          URL="https://github.com/zed-industries/zed/releases/download/${VERSION}/zed-linux-${ARCH}.tar.gz"
-          echo "Downloading $URL"
+          ZED_ARCH="${{ matrix.arch.zed_arch }}"
+          URL="https://github.com/zed-industries/zed/releases/download/${VERSION}/zed-linux-${ZED_ARCH}.tar.gz"
+          echo "Downloading: $URL"
           wget -q "$URL" -O zed.tar.gz
           tar -xzf zed.tar.gz
-          ls -la
+          echo "==> Extracted layout:"
+          find . -maxdepth 4 -not -path './.git/*' | sort
 
       # ── 7. Build the AppDir ──────────────────────────────────────────────────
       - name: Build AppDir
@@ -123,14 +137,13 @@ jobs:
       - name: Package AppImage
         if: steps.existing.outputs.skip == 'false'
         run: |
-          ARCH="${{ matrix.arch.appimage_arch }}"
-          VERSION="${{ steps.version.outputs.version_num }}"
-          OUTPUT="zed-${ARCH}.AppImage"
+          TARGET_ARCH="${{ matrix.arch.appimage_arch }}"
+          OUTPUT="zed-${TARGET_ARCH}.AppImage"
 
-          ARCH=$ARCH appimagetool AppDir "$OUTPUT"
+          # ARCH env var tells appimagetool the target architecture
+          ARCH=$TARGET_ARCH appimagetool AppDir "$OUTPUT"
           chmod +x "$OUTPUT"
 
-          # Verify it was created
           ls -lh "$OUTPUT"
           file "$OUTPUT"
           echo "appimage_path=$OUTPUT" >> "$GITHUB_ENV"
@@ -139,28 +152,34 @@ jobs:
       - name: Compute SHA256
         if: steps.existing.outputs.skip == 'false'
         run: |
-          sha256sum "${{ env.appimage_path }}" > "${{ env.appimage_path }}.sha256"
-          cat "${{ env.appimage_path }}.sha256"
+          sha256sum "${{ env.appimage_path }}" \
+            | tee "${{ env.appimage_path }}.sha256"
 
-      # ── 10. Create/update GitHub Release and upload assets ──────────────────
-      - name: Upload to GitHub Release
+      # ── 10. Create release (idempotent) then upload assets ──────────────────
+      - name: Create GitHub Release
         if: steps.existing.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.version.outputs.version }}"
-          ARCH="${{ matrix.arch.zed_arch }}"
+          NOTES=$(sed \
+            -e "s|{{VERSION}}|$TAG|g" \
+            scripts/release-notes-template.md)
 
-          # Create the release if it doesn't exist yet
+          # ---> silently succeeds if the release already exists
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "Zed $TAG AppImage" \
-            --notes "$(cat scripts/release-notes-template.md | \
-              sed "s/{{VERSION}}/$TAG/g" | \
-              sed "s/{{ARCH}}/$ARCH/g")" \
+            --notes "$NOTES" \
             2>/dev/null || true
 
-          # Upload AppImage and checksum (overwrite if re-running)
+      - name: Upload AppImage assets
+        if: steps.existing.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.version }}"
+
           gh release upload "$TAG" \
             "${{ env.appimage_path }}" \
             "${{ env.appimage_path }}.sha256" \
