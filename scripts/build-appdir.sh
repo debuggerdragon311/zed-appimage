@@ -59,23 +59,62 @@ if [[ -d "$ZED_APP/share" ]]; then
   echo "Copied upstream share/ tree"
 fi
 
-# ── Ensure a 256x256 icon exists (AppImage spec needs one at root) ────────────
-# Prefer the upstream icon; fall back to any png we can find; then generate one
-ICON_DEST="$APPDIR/usr/share/icons/hicolor/256x256/apps/zed.png"
+# ── Fix icon names and positions ──────────────────────────────────────────────
+# Problem 1: Upstream ships icon as "dev.zed.Zed.png" but desktop says Icon=zed
+#            → rename every icon file to zed.png so the name matches
+# Problem 2: Upstream ships icon only at 1024x1024
+#            → appimagetool and DE icon themes need 256x256 specifically
+# Problem 3: AppImage spec requires AppDir/zed.png at the root
 
-if [[ ! -f "$ICON_DEST" ]]; then
-  # Search for any png icon in the copied share tree
-  FOUND=$(find "$APPDIR/usr/share/icons" -name '*.png' | head -1 || true)
-  if [[ -n "$FOUND" ]]; then
-    convert "$FOUND" -resize 256x256 "$ICON_DEST" 2>/dev/null || cp "$FOUND" "$ICON_DEST"
-  else
-    echo "Generating fallback icon..."
-    convert -size 256x256 xc:'#084CCF' \
-      -fill white -font DejaVu-Sans-Bold -pointsize 120 \
-      -gravity Center -annotate 0 'Z' "$ICON_DEST"
-  fi
+echo "==> Fixing icon names and sizes..."
+
+# Rename all upstream icon files from dev.zed.Zed.* → zed.*
+find "$APPDIR/usr/share/icons" -type f \( -name 'dev.zed.Zed.*' -o -name 'zed-editor.*' \) | \
+while read -r f; do
+  EXT="${f##*.}"
+  DIR="$(dirname "$f")"
+  mv "$f" "$DIR/zed.$EXT"
+  echo "  Renamed: $f → $DIR/zed.$EXT"
+done
+
+# Find the best source icon (largest png available after rename)
+SOURCE_ICON=$(find "$APPDIR/usr/share/icons" -name 'zed.png' \
+  | awk -F/ '{print NF, $0}' | sort -rn | head -1 | cut -d' ' -f2- || true)
+
+if [[ -z "$SOURCE_ICON" ]]; then
+  # Nothing in share/icons at all — generate a fallback
+  echo "  No upstream icon found, generating fallback..."
+  SOURCE_ICON="/tmp/zed-icon-fallback.png"
+  convert -size 1024x1024 xc:'#084CCF' \
+    -fill white -font DejaVu-Sans-Bold -pointsize 500 \
+    -gravity Center -annotate 0 'Z' "$SOURCE_ICON"
 fi
-cp "$ICON_DEST" "$APPDIR/zed.png"
+
+echo "  Source icon: $SOURCE_ICON ($(du -sh "$SOURCE_ICON" | cut -f1))"
+
+# Ensure 256x256 exists — this is what appimagetool looks for
+mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+ICON_256="$APPDIR/usr/share/icons/hicolor/256x256/apps/zed.png"
+if [[ ! -f "$ICON_256" ]]; then
+  convert "$SOURCE_ICON" -resize 256x256 "$ICON_256"
+  echo "  Created 256x256 icon"
+fi
+
+# Ensure 512x512 exists (nice to have for HiDPI desktops)
+mkdir -p "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+ICON_512="$APPDIR/usr/share/icons/hicolor/512x512/apps/zed.png"
+if [[ ! -f "$ICON_512" ]]; then
+  convert "$SOURCE_ICON" -resize 512x512 "$ICON_512"
+  echo "  Created 512x512 icon"
+fi
+
+# AppImage spec: root-level icon must match Icon= name in desktop file (Icon=zed → zed.png)
+# appimagetool also creates a .DirIcon symlink from this
+cp "$ICON_256" "$APPDIR/zed.png"
+echo "  Placed root zed.png (AppImage spec + .DirIcon source)"
+
+echo "==> Icon tree:"
+find "$APPDIR/usr/share/icons" -type f | sort
 
 # ── Desktop entry ─────────────────────────────────────────────────────────────
 # Use upstream desktop file if present, otherwise create one
